@@ -1,0 +1,12 @@
+langchain
+langchain-openai
+langchain-community
+langchain-huggingface
+pgvector
+psycopg2-binary
+pymupdf
+sentence-transformers
+rank-bm25
+openai
+python-dotenv
+ragas
