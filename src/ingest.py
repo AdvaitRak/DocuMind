@@ -4,8 +4,8 @@ import os
 import fitz                          # PyMuPDF
 import pickle
 from dotenv import load_dotenv
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_postgres import PGVector
 from rank_bm25 import BM25Okapi
@@ -24,7 +24,6 @@ embeddings = AzureOpenAIEmbeddings(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-    dimensions=1536
 )
 
 splitter = RecursiveCharacterTextSplitter(
@@ -56,7 +55,6 @@ def extract_pages(pdf_path: str) -> list[Document]:
     print(f"  extracted {len(pages)} pages")
     return pages
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
 
 def chunk_documents(pages: list[Document]) -> list[Document]:
     """
@@ -70,7 +68,6 @@ def chunk_documents(pages: list[Document]) -> list[Document]:
     print(f"  created {len(chunks)} chunks")
     return chunks
 
-# ── BM25 index ────────────────────────────────────────────────────────────────
 
 def build_bm25_index(chunks: list[Document]):
     """
@@ -87,7 +84,6 @@ def build_bm25_index(chunks: list[Document]):
 
     print(f"  BM25 index saved → {BM25_INDEX_PATH}")
 
-# ── Vector store ──────────────────────────────────────────────────────────────
 
 def store_in_pgvector(chunks: list[Document]) -> PGVector:
     """
@@ -102,10 +98,9 @@ def store_in_pgvector(chunks: list[Document]) -> PGVector:
         connection_string=CONNECTION_STRING,
         pre_delete_collection=False    # append, don't wipe existing data
     )
-    print(f"  stored in pgvector")
+    print("stored in pgvector")
     return vectorstore
 
-# ── Main ingestion pipeline ───────────────────────────────────────────────────
 
 def ingest_pdf(pdf_path: str):
     """

@@ -195,7 +195,7 @@ class CostTracker:
         print(f"  Total queries : {self.total_queries}")
         print(f"  Total tokens  : {self.total_tokens:,}")
         print(f"  Total cost    : ${self.total_cost_usd:.4f}")
-        print(f"  By pipeline   :")
+        print("  By pipeline   :")
         for pipeline, cost in self.by_pipeline.items():
             print(f"    {pipeline:20s} ${cost:.4f}")
         print("────────────────────────────────────────────────────\n")

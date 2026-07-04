@@ -13,3 +13,5 @@ groq
 python-dotenv
 numpy
 tiktoken
+langchain-core
+langchain-text-splitters
