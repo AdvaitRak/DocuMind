@@ -10,7 +10,7 @@ from langchain_openai import AzureOpenAIEmbeddings
 from langchain_postgres import PGVector
 from rank_bm25 import BM25Okapi
 import tiktoken
-
+from src.metrics import StageTimer, cost_tracker, TokenUsage
 load_dotenv()
 
 
@@ -91,13 +91,16 @@ def store_in_pgvector(chunks: list[Document]) -> PGVector:
     LangChain handles batching, DB connection, and table creation automatically.
     """
     print(f"  embedding + storing {len(chunks)} chunks in pgvector...")
-    vectorstore = PGVector.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=COLLECTION_NAME,
-        connection_string=CONNECTION_STRING,
-        pre_delete_collection=False    # append, don't wipe existing data
-    )
+    with StageTimer() as t1:
+        vectorstore = PGVector(
+            embeddings=embeddings,
+            collection_name=COLLECTION_NAME,
+            connection=CONNECTION_STRING,
+        )
+    print(f"    DB connection: {t1.elapsed_ms:.0f}ms")
+
+    with StageTimer() as t2:
+        vectorstore.add_documents(chunks)
     print("stored in pgvector")
     return vectorstore
 
@@ -109,33 +112,25 @@ def ingest_pdf(pdf_path: str):
     """
     print(f"\nIngesting: {os.path.basename(pdf_path)}")
 
-    from src.metrics import StageTimer, cost_tracker, TokenUsage
-
-    # 1. extract
+   
     with StageTimer() as t:
         pages = extract_pages(pdf_path)
     print(f"  extraction: {t.elapsed_ms:.0f}ms")
 
-    # 2. chunk
     with StageTimer() as t:
         chunks = chunk_documents(pages)
     print(f"  chunking: {t.elapsed_ms:.0f}ms")
 
-    # 3. embed + store (timed together since Azure call is inside store)
     with StageTimer() as t:
         vectorstore = store_in_pgvector(chunks)
     print(f"  embed+store: {t.elapsed_ms:.0f}ms")
 
-    # track embedding token usage
-    # ada-002 tokenizes at ~0.75 tokens per word
-    # track embedding token usage — exact count via tiktoken
     enc= tiktoken.encoding_for_model("text-embedding-ada-002")
     exact_tokens= sum(len(enc.encode(c.page_content)) for c in chunks)
     usage = TokenUsage(embedding_tokens=exact_tokens)
     print(f"  {exact_tokens} embedding tokens (exact)")
     print(f"  ${usage.embedding_cost:.6f} embedding cost")
 
-    # 4. build BM25 index from all chunks
     with StageTimer() as t:
         build_bm25_index(chunks)
     print(f"  BM25 indexing: {t.elapsed_ms:.0f}ms")
