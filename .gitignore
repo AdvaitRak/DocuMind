@@ -11,3 +11,6 @@ __pycache__/
 # IDE (optional but recommended)
 .vscode/
 .idea/
+
+data/
+indexes/
