@@ -1,18 +1,41 @@
+# LangChain
 langchain
+langchain-core
 langchain-openai
 langchain-postgres
+langchain-text-splitters
+langchain-groq
+
+# Vector store
 pgvector
 psycopg[binary]
+sqlalchemy
+
+# PDF parsing
 pymupdf
+
+# Sparse search
 rank-bm25
+
+# Reranking
 sentence-transformers
+
+# Evaluation
 ragas
+datasets
+
+# Observability
 langsmith
+
+# LLM providers
 openai
 groq
+
+# API
+fastapi
+uvicorn
+
+# Utils
 python-dotenv
 numpy
 tiktoken
-langchain-core
-langchain-text-splitters
-langchain-groq
