@@ -30,8 +30,8 @@ vectorstore = PGVector(
     connection=CONNECTION_STRING,
 )
 
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
-
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+print(f"Reranker loaded — id: {id(reranker)}")  # prints memory address
 
 def load_bm25() -> tuple[BM25Okapi, list[Document]]:
     if not os.path.exists(BM25_INDEX_PATH):
@@ -96,13 +96,19 @@ def rerank(
     docs:  list[Document],
     top_n: int = 5
 ) -> list[Document]:
-    pairs  = [(query, doc.page_content) for doc in docs]
+    import time
+    print("  rerank() entered")
+    t0 = time.perf_counter()
+    
+    pairs = [(query, doc.page_content) for doc in docs]
+    print(f"  pairs built: {(time.perf_counter()-t0)*1000:.0f}ms")
+    print(f"  avg doc length: {sum(len(d.page_content) for d in docs)//len(docs)} chars")
+    
+    t1 = time.perf_counter()
     scores = reranker.predict(pairs)
-    reranked = sorted(
-        zip(docs, scores),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    print(f"  predict: {(time.perf_counter()-t1)*1000:.0f}ms")
+    
+    reranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
     return [doc for doc, _ in reranked[:top_n]]
 
 
@@ -151,18 +157,29 @@ def retrieve_hybrid_rerank(
     with StageTimer() as t:
         dense_hits = dense_search(query, top_k=50)
     metrics.dense_retrieval_ms = t.elapsed_ms
+    print(f"  dense done: {metrics.dense_retrieval_ms:.0f}ms, {len(dense_hits)} hits")
 
     with StageTimer() as t:
         sparse_hits = sparse_search(query, top_k=50)
     metrics.sparse_retrieval_ms = t.elapsed_ms
+    print(f"  sparse done: {metrics.sparse_retrieval_ms:.0f}ms, {len(sparse_hits)} hits")
 
     with StageTimer() as t:
         fused = rrf_fusion(dense_hits, sparse_hits)
     metrics.rrf_fusion_ms = t.elapsed_ms
+    print(f"  rrf done: {metrics.rrf_fusion_ms:.0f}ms, {len(fused)} fused")
 
+    print(f"  → about to rerank {len(fused)} docs")
+    import time
+    wall_start = time.perf_counter()
+    
     with StageTimer() as t:
         final = rerank(query, fused, top_n=5)
+    
+    wall_end = time.perf_counter()
     metrics.rerank_ms = t.elapsed_ms
+    print(f"  → StageTimer: {metrics.rerank_ms:.0f}ms")
+    print(f"  → Wall clock: {(wall_end-wall_start)*1000:.0f}ms")
 
     metrics.chunks_retrieved    = len(fused)
     metrics.chunks_after_rerank = len(final)
@@ -207,7 +224,7 @@ if __name__ == "__main__":
         print(f"\n[{i+1}] Source: {doc.metadata.get('source')} | Page: {doc.metadata.get('page')}")
         print(f"    {doc.page_content[:200]}...")
     
-    print(f"\n── Latency ──────────────────────────────────────────")
+    print("\n── Latency ──────────────────────────────────────────")
     print(f"  Dense:   {metrics.dense_retrieval_ms:.0f}ms")
     print(f"  Sparse:  {metrics.sparse_retrieval_ms:.0f}ms")
     print(f"  RRF:     {metrics.rrf_fusion_ms:.0f}ms")
