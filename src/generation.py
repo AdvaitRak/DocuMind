@@ -9,19 +9,20 @@ from langchain_core.documents import Document
 from langsmith import Client
 from src.retreival import retrieve
 from src.metrics import PipelineMetrics, TokenUsage, cost_tracker
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
 langsmith_client = Client()
 
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0,        # deterministic — important for eval consistency
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    google_api_key=os.getenv("GOOGLE_API_KEY"),
+    temperature=0,
     max_tokens=1024,
 )
-
 
 # cl100k_base is close enough for Llama token counting
 enc = tiktoken.get_encoding("cl100k_base")
@@ -142,6 +143,7 @@ def generate(
         "question": question,
         "answer":   answer,
         "sources":  sources,
+        "docs":     docs,
         "metrics":  summary,
     }
 
@@ -183,7 +185,7 @@ if __name__ == "__main__":
     
     # latency breakdown
     m = result["metrics"]
-    print(f"\n── Latency breakdown ────────────────────────────────")
+    print("\n── Latency breakdown ────────────────────────────────")
     print(f"  Dense retrieval : {m['latency']['dense_retrieval_ms']:.0f}ms")
     print(f"  Sparse retrieval: {m['latency']['sparse_retrieval_ms']:.0f}ms")
     print(f"  RRF fusion      : {m['latency']['rrf_fusion_ms']:.0f}ms")

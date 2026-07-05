@@ -39,3 +39,4 @@ uvicorn
 python-dotenv
 numpy
 tiktoken
+aiofiles

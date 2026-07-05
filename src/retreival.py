@@ -155,12 +155,12 @@ def retrieve_hybrid_rerank(
 ) -> list[Document]:
     """Pipeline C — dense + sparse + RRF + cross-encoder rerank"""
     with StageTimer() as t:
-        dense_hits = dense_search(query, top_k=50)
+        dense_hits = dense_search(query, top_k=20)
     metrics.dense_retrieval_ms = t.elapsed_ms
     print(f"  dense done: {metrics.dense_retrieval_ms:.0f}ms, {len(dense_hits)} hits")
 
     with StageTimer() as t:
-        sparse_hits = sparse_search(query, top_k=50)
+        sparse_hits = sparse_search(query, top_k=20)
     metrics.sparse_retrieval_ms = t.elapsed_ms
     print(f"  sparse done: {metrics.sparse_retrieval_ms:.0f}ms, {len(sparse_hits)} hits")
 
