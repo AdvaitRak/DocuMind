@@ -69,7 +69,7 @@ def chunk_documents(pages: list[Document]) -> list[Document]:
     return chunks
 
 
-def build_bm25_index(chunks: list[Document]):
+def build_bm25_index(chunks: list[Document])-> tuple:
     """
     Build BM25 index from all chunks and save to disk.
     Called after every ingestion so index stays in sync with vector store.
@@ -83,7 +83,7 @@ def build_bm25_index(chunks: list[Document]):
         pickle.dump({"bm25": bm25, "docs": chunks}, f)
 
     print(f"  BM25 index saved → {BM25_INDEX_PATH}")
-
+    return bm25, chunks
 
 def store_in_pgvector(chunks: list[Document]) -> PGVector:
     """
@@ -105,7 +105,7 @@ def store_in_pgvector(chunks: list[Document]) -> PGVector:
     return vectorstore
 
 
-def ingest_pdf(pdf_path: str):
+def ingest_pdf(pdf_path: str,session_id:str):
     """
     Full ingestion pipeline:
     PDF → extract pages → chunk → embed → pgvector + BM25 index
@@ -119,6 +119,8 @@ def ingest_pdf(pdf_path: str):
 
     with StageTimer() as t:
         chunks = chunk_documents(pages)
+        for chunk in chunks:
+            chunk.metadata["session_id"] = session_id
     print(f"  chunking: {t.elapsed_ms:.0f}ms")
 
     with StageTimer() as t:
@@ -132,16 +134,9 @@ def ingest_pdf(pdf_path: str):
     print(f"  ${usage.embedding_cost:.6f} embedding cost")
 
     with StageTimer() as t:
-        build_bm25_index(chunks)
+        bm25, docs=build_bm25_index(chunks)
     print(f"  BM25 indexing: {t.elapsed_ms:.0f}ms")
 
     print(f"\nDone. {len(chunks)} chunks ready for retrieval.\n")
-    return vectorstore
+    return vectorstore,bm25, docs
 
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python -m src.ingest <path_to_pdf>")
-        sys.exit(1)
-    ingest_pdf(sys.argv[1])

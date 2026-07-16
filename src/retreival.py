@@ -10,6 +10,11 @@ from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 from src.metrics import StageTimer, PipelineMetrics
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
+import time
+from sqlalchemy.exc import OperationalError
+
 load_dotenv()
 
 CONNECTION_STRING = os.getenv("DATABASE_URL")
@@ -33,6 +38,38 @@ vectorstore = PGVector(
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 print(f"Reranker loaded — id: {id(reranker)}")  # prints memory address
 
+def create_engine_with_retry(url: str, retries: int = 3, delay: float = 2.0):
+    for attempt in range(retries):
+        try:
+            eng = create_engine(
+                url,
+                poolclass=QueuePool,
+                pool_size=5,
+                max_overflow=10,
+                pool_pre_ping=True,
+                pool_recycle=300,
+            )
+            with eng.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            print(f"  DB connected on attempt {attempt + 1}")
+            return eng
+        except OperationalError as e:
+            print(f"  DB connection attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+    raise Exception("Failed to connect to DB after retries")
+
+
+engine = create_engine_with_retry(os.getenv("DATABASE_URL"))
+
+vectorstore = PGVector(
+    embeddings=embeddings,
+    collection_name=COLLECTION_NAME,
+    connection=engine,
+)
+
+
+
 def load_bm25() -> tuple[BM25Okapi, list[Document]]:
     if not os.path.exists(BM25_INDEX_PATH):
         raise FileNotFoundError(
@@ -43,20 +80,29 @@ def load_bm25() -> tuple[BM25Okapi, list[Document]]:
     print(f"BM25 index loaded — {len(data['docs'])} docs")
     return data["bm25"], data["docs"]
 
-bm25_index, bm25_corpus = load_bm25()
 
 
 
-def dense_search(query: str, top_k: int = 50) -> list[Document]:
-    return vectorstore.similarity_search(query, k=top_k)
+def dense_search(query: str,session_id: str, top_k: int = 50) -> list[Document]:
+    print(f"  dense_search session_id type: {type(session_id)} value: {session_id}")
+    return vectorstore.similarity_search(query,
+                                        k=top_k,
+                                        filter={"session_id": session_id})
 
 
 
-def sparse_search(query: str, top_k: int = 50) -> list[Document]:
+def sparse_search(query: str, session_id: str, top_k: int = 50) -> list[Document]:
+    from main import sessions
+
+    session = sessions.get(session_id)
+    if not session or not session["bm25"]:
+        print(f"  No BM25 index for session {session_id[:8]} — skipping sparse search")
+        return []
+
     tokens = query.lower().split()
-    scores = bm25_index.get_scores(tokens)
+    scores = session["bm25"].get_scores(tokens)
     scored = sorted(
-        zip(bm25_corpus, scores),
+        zip(session["docs"], scores),
         key=lambda x: x[1],
         reverse=True
     )
@@ -99,7 +145,9 @@ def rerank(
     import time
     print("  rerank() entered")
     t0 = time.perf_counter()
-    
+    if not docs:
+        print("  No docs to rerank — returning empty list")
+        return []
     pairs = [(query, doc.page_content) for doc in docs]
     print(f"  pairs built: {(time.perf_counter()-t0)*1000:.0f}ms")
     print(f"  avg doc length: {sum(len(d.page_content) for d in docs)//len(docs)} chars")
@@ -112,31 +160,22 @@ def rerank(
     return [doc for doc, _ in reranked[:top_n]]
 
 
-
-def retrieve_dense_only(
-    query:   str,
-    metrics: PipelineMetrics
-) -> list[Document]:
-    """Pipeline A — baseline"""
+def retrieve_dense_only(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        results = dense_search(query, top_k=5)
+        results = dense_search(query, session_id, top_k=5)  # ← session_id not metrics
     metrics.dense_retrieval_ms  = t.elapsed_ms
     metrics.chunks_retrieved    = len(results)
     metrics.chunks_after_rerank = len(results)
     return results
 
 
-def retrieve_hybrid(
-    query:   str,
-    metrics: PipelineMetrics
-) -> list[Document]:
-    """Pipeline B — dense + sparse + RRF, no reranking"""
+def retrieve_hybrid(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        dense_hits = dense_search(query, top_k=50)
+        dense_hits = dense_search(query, session_id, top_k=20)  # ← session_id
     metrics.dense_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
-        sparse_hits = sparse_search(query, top_k=50)
+        sparse_hits = sparse_search(query, session_id, top_k=20)  # ← session_id
     metrics.sparse_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
@@ -149,42 +188,26 @@ def retrieve_hybrid(
     return top_5
 
 
-def retrieve_hybrid_rerank(
-    query:   str,
-    metrics: PipelineMetrics
-) -> list[Document]:
-    """Pipeline C — dense + sparse + RRF + cross-encoder rerank"""
+def retrieve_hybrid_rerank(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        dense_hits = dense_search(query, top_k=20)
+        dense_hits = dense_search(query, session_id, top_k=20)  # ← session_id
     metrics.dense_retrieval_ms = t.elapsed_ms
-    print(f"  dense done: {metrics.dense_retrieval_ms:.0f}ms, {len(dense_hits)} hits")
 
     with StageTimer() as t:
-        sparse_hits = sparse_search(query, top_k=20)
+        sparse_hits = sparse_search(query, session_id, top_k=20)  # ← session_id
     metrics.sparse_retrieval_ms = t.elapsed_ms
-    print(f"  sparse done: {metrics.sparse_retrieval_ms:.0f}ms, {len(sparse_hits)} hits")
 
     with StageTimer() as t:
         fused = rrf_fusion(dense_hits, sparse_hits)
     metrics.rrf_fusion_ms = t.elapsed_ms
-    print(f"  rrf done: {metrics.rrf_fusion_ms:.0f}ms, {len(fused)} fused")
 
-    print(f"  → about to rerank {len(fused)} docs")
-    import time
-    wall_start = time.perf_counter()
-    
     with StageTimer() as t:
         final = rerank(query, fused, top_n=5)
-    
-    wall_end = time.perf_counter()
     metrics.rerank_ms = t.elapsed_ms
-    print(f"  → StageTimer: {metrics.rerank_ms:.0f}ms")
-    print(f"  → Wall clock: {(wall_end-wall_start)*1000:.0f}ms")
 
     metrics.chunks_retrieved    = len(fused)
     metrics.chunks_after_rerank = len(final)
     return final
-
 
 
 PIPELINE_MAP = {
@@ -196,7 +219,9 @@ PIPELINE_MAP = {
 def retrieve(
     query:    str,
     metrics:  PipelineMetrics,
+    session_id: str,
     pipeline: str = "hybrid_rerank"
+    
 ) -> list[Document]:
     """
     Call this from generation.py.
@@ -205,19 +230,19 @@ def retrieve(
     if pipeline not in PIPELINE_MAP:
         raise ValueError(f"Unknown pipeline: {pipeline}. Choose from {list(PIPELINE_MAP.keys())}")
 
-    return PIPELINE_MAP[pipeline](query, metrics)
+    return PIPELINE_MAP[pipeline](query, metrics,session_id)
 
 if __name__ == "__main__":
     from src.metrics import PipelineMetrics
 
     query = "what are your technical skills"  # change this to anything
-
+    session_id = "Enter yours session ID"
     metrics = PipelineMetrics(
         pipeline_variant="hybrid_rerank",
         query=query
     )
 
-    results = retrieve(query, metrics, pipeline="hybrid_rerank")
+    results = retrieve(query, metrics,session_id, pipeline="hybrid_rerank")
 
     print(f"\n── Retrieved {len(results)} chunks ──────────────────────")
     for i, doc in enumerate(results):

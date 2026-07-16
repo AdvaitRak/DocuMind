@@ -89,7 +89,6 @@ def _evaluate(question: str, answer: str, contexts: list[str], ground_truth: str
             llm=ragas_llm,
             embeddings=ragas_embeddings,
             raise_exceptions=False,
-            timeout=120,
         )
         scores_df = result.to_pandas()
         print(f"  Available columns: {list(scores_df.columns)}")

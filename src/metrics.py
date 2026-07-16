@@ -73,7 +73,7 @@ class PipelineMetrics:
     """
     pipeline_variant: str          # "dense_only" | "hybrid" | "hybrid_rerank"
     query: str
-
+    session_id: str=""
     # latency per stage (ms)
     dense_retrieval_ms:  float = 0.0
     sparse_retrieval_ms: float = 0.0
