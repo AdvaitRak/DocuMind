@@ -22,6 +22,7 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0,
     max_tokens=1024,
+    streaming=True
 )
 
 # cl100k_base is close enough for Llama token counting
@@ -67,6 +68,7 @@ def count_tokens(text: str) -> int:
 
 def generate(
     question: str,
+    session_id: str,
     pipeline: str = "hybrid_rerank",
     run_id:   str = None
 ) -> dict:
@@ -85,11 +87,12 @@ def generate(
 
     metrics = PipelineMetrics(
         pipeline_variant=pipeline,
-        query=question
+        query=question,
+        session_id=session_id,
     )
 
    
-    docs    = retrieve(question, metrics, pipeline=pipeline)
+    docs    = retrieve(question, metrics,session_id, pipeline=pipeline)
     context = format_context(docs)
 
 
@@ -144,9 +147,79 @@ def generate(
         "answer":   answer,
         "sources":  sources,
         "docs":     docs,
-        "metrics":  summary,
+        "metrics":  metrics.summary(),
     }
 
+# generation.py — add after generate()
+
+async def generate_stream(
+    question: str,
+    session_id: str,
+    pipeline: str = "hybrid_rerank",
+):
+    """
+    Streaming version of generate().
+    Yields tokens as they come from the LLM.
+    Retrieval still runs fully before streaming starts.
+    """
+    from src.metrics import StageTimer
+
+    metrics = PipelineMetrics(
+        pipeline_variant=pipeline,
+        query=question,
+        session_id=session_id,
+    )
+
+    # ── Retrieval — runs fully first ──────────────────────────────────────────
+    docs    = retrieve(question, metrics,session_id, pipeline=pipeline)
+    if not docs:
+        yield {
+            "type":    "error",
+            "message": "No documents found. Please upload a PDF first."
+        }
+        return
+    context = format_context(docs)
+
+    # ── Build sources ─────────────────────────────────────────────────────────
+    sources = [
+        {
+            "source": d.metadata.get("source", "unknown"),
+            "page":   d.metadata.get("page", "?"),
+            "chunk":  d.page_content[:100] + "..."
+        }
+        for d in docs
+    ]
+
+    # ── Stream generation ─────────────────────────────────────────────────────
+    prompt        = prompt_template.format_messages(
+        context=context,
+        question=question
+    )
+    input_tokens  = count_tokens(context + question)
+    output_tokens = 0
+
+    with StageTimer() as t:
+        async for chunk in llm.astream(prompt):
+            token = chunk.content
+            if token:
+                output_tokens += count_tokens(token)
+                yield {
+                    "type":  "token",
+                    "token": token
+                }
+
+    metrics.generation_ms        = t.elapsed_ms
+    metrics.tokens.llm_input_tokens  = input_tokens
+    metrics.tokens.llm_output_tokens = output_tokens
+
+    cost_tracker.record(metrics)
+
+    # ── Yield final metadata ──────────────────────────────────────────────────
+    yield {
+        "type":    "done",
+        "sources": sources,
+        "metrics": metrics.summary()
+    }
 
 
 def compare_pipelines(question: str) -> dict:

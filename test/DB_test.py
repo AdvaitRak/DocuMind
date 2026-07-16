@@ -36,7 +36,7 @@ def test_raw(runs: int = 5):
         print(f"  Best    : {min(times):.0f}ms")
         print(f"  Worst   : {max(times):.0f}ms")
 
-# ── Test 2: SQLAlchemy connection pool (reuses connections) ───────────────────
+
 
 def test_pool(runs: int = 5):
     print(f"\n── SQLAlchemy pool (reused connections) ─────────────")

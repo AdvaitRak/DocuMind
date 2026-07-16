@@ -40,3 +40,6 @@ python-dotenv
 numpy
 tiktoken
 aiofiles
+python-multipart
+apscheduler
+slowapi
