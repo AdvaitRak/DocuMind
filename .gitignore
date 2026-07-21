@@ -1,16 +1,13 @@
-# Virtual environment
-.venv/
-
-# Environment variables
+# .gitignore
 .env
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# IDE (optional but recommended)
-.vscode/
-.idea/
-
-data/
+.venv
+__pycache__
+*.pyc
+*.pyo
 indexes/
+data/pdfs/
+*.pkl
+eval_results.json
+test_*.py
+run_eval.py
+data/test_set.py

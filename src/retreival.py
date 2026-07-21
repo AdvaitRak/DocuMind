@@ -35,7 +35,11 @@ vectorstore = PGVector(
     connection=CONNECTION_STRING,
 )
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder(
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    backend="onnx",
+    model_kwargs={"file_name": "onnx/model_quint8_avx2.onnx"} 
+)
 print(f"Reranker loaded — id: {id(reranker)}")  # prints memory address
 
 def create_engine_with_retry(url: str, retries: int = 3, delay: float = 2.0):
@@ -162,8 +166,18 @@ def rerank(
 
 def retrieve_dense_only(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        results = dense_search(query, session_id, top_k=5)  # ← session_id not metrics
-    metrics.dense_retrieval_ms  = t.elapsed_ms
+        results = dense_search(query, session_id, top_k=5)
+    metrics.dense_retrieval_ms = t.elapsed_ms
+
+    # normalize vector scores to 0-1
+    if results:
+        max_v = max(1 / (60 + i + 1) for i in range(len(results))) + 1e-8
+        for i, doc in enumerate(results):
+            raw = 1 / (60 + i + 1)
+            doc.metadata["vector_score"]   = round(raw / max_v, 4)
+            doc.metadata["bm25_score"]     = 0.0
+            doc.metadata["reranker_score"] = 0.0
+
     metrics.chunks_retrieved    = len(results)
     metrics.chunks_after_rerank = len(results)
     return results
@@ -171,16 +185,33 @@ def retrieve_dense_only(query: str, metrics: PipelineMetrics, session_id: str) -
 
 def retrieve_hybrid(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        dense_hits = dense_search(query, session_id, top_k=20)  # ← session_id
+        dense_hits = dense_search(query, session_id, top_k=10)
     metrics.dense_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
-        sparse_hits = sparse_search(query, session_id, top_k=20)  # ← session_id
+        sparse_hits = sparse_search(query, session_id, top_k=10)
     metrics.sparse_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
         fused = rrf_fusion(dense_hits, sparse_hits)
     metrics.rrf_fusion_ms = t.elapsed_ms
+
+    # attach RRF scores
+    dense_contents  = {d.page_content: i for i, d in enumerate(dense_hits)}
+    sparse_contents = {d.page_content: i for i, d in enumerate(sparse_hits)}
+
+    for doc in fused:
+        doc.metadata["vector_score"] = round(1 / (60 + dense_contents.get(doc.page_content, 60) + 1), 4)
+        doc.metadata["bm25_score"]   = round(1 / (60 + sparse_contents.get(doc.page_content, 60) + 1), 4)
+        doc.metadata["reranker_score"] = 0.0
+
+    # normalize vector and bm25 to 0-1
+    if fused:
+        max_v = max(d.metadata["vector_score"] for d in fused) + 1e-8
+        max_b = max(d.metadata["bm25_score"]   for d in fused) + 1e-8
+        for doc in fused:
+            doc.metadata["vector_score"] = round(doc.metadata["vector_score"] / max_v, 4)
+            doc.metadata["bm25_score"]   = round(doc.metadata["bm25_score"]   / max_b, 4)
 
     top_5 = fused[:5]
     metrics.chunks_retrieved    = len(fused)
@@ -190,25 +221,49 @@ def retrieve_hybrid(query: str, metrics: PipelineMetrics, session_id: str) -> li
 
 def retrieve_hybrid_rerank(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
-        dense_hits = dense_search(query, session_id, top_k=20)  # ← session_id
+        dense_hits = dense_search(query, session_id, top_k=10)
     metrics.dense_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
-        sparse_hits = sparse_search(query, session_id, top_k=20)  # ← session_id
+        sparse_hits = sparse_search(query, session_id, top_k=10)
     metrics.sparse_retrieval_ms = t.elapsed_ms
 
     with StageTimer() as t:
         fused = rrf_fusion(dense_hits, sparse_hits)
     metrics.rrf_fusion_ms = t.elapsed_ms
 
+    # ── attach RRF scores ─────────────────────────────────────────────────────
+    dense_contents  = {d.page_content: i for i, d in enumerate(dense_hits)}
+    sparse_contents = {d.page_content: i for i, d in enumerate(sparse_hits)}
+
+    for doc in fused:
+        doc.metadata["vector_score"] = round(1 / (60 + dense_contents.get(doc.page_content, 60) + 1), 4)
+        doc.metadata["bm25_score"]   = round(1 / (60 + sparse_contents.get(doc.page_content, 60) + 1), 4)
+
     with StageTimer() as t:
-        final = rerank(query, fused, top_n=5)
+        pairs           = [(query, doc.page_content) for doc in fused]
+        reranker_scores = reranker.predict(pairs) if fused else []
+
+        # ── normalize reranker scores to 0-1 ─────────────────────────────────
+        if len(reranker_scores) > 0:
+            min_s = float(min(reranker_scores))
+            max_s = float(max(reranker_scores))
+            span  = max_s - min_s + 1e-8
+            normalized = [round((float(s) - min_s) / span, 4) for s in reranker_scores]
+        else:
+            normalized = []
+
+        for doc, score in zip(fused, normalized):
+            doc.metadata["reranker_score"] = score
+
+        final = sorted(zip(fused, normalized), key=lambda x: x[1], reverse=True)[:5]
+        final = [doc for doc, _ in final]
+
     metrics.rerank_ms = t.elapsed_ms
 
     metrics.chunks_retrieved    = len(fused)
     metrics.chunks_after_rerank = len(final)
     return final
-
 
 PIPELINE_MAP = {
     "dense_only":      retrieve_dense_only,

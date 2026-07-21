@@ -4,7 +4,7 @@ langchain-core
 langchain-openai
 langchain-postgres
 langchain-text-splitters
-langchain-groq
+langchain-community
 
 # Vector store
 pgvector
@@ -14,32 +14,31 @@ sqlalchemy
 # PDF parsing
 pymupdf
 
+# Document parsing
+python-docx
+python-pptx
+
 # Sparse search
 rank-bm25
 
 # Reranking
 sentence-transformers
-
-# Evaluation
-ragas
-datasets
+optimum[onnxruntime]
+# API
+fastapi
+uvicorn
+python-multipart
+slowapi
+apscheduler
 
 # Observability
 langsmith
 
 # LLM providers
 openai
-groq
-
-# API
-fastapi
-uvicorn
 
 # Utils
 python-dotenv
 numpy
 tiktoken
 aiofiles
-python-multipart
-apscheduler
-slowapi

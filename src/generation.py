@@ -3,7 +3,7 @@
 import os
 import tiktoken
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langsmith import Client
@@ -17,25 +17,43 @@ langsmith_client = Client()
 
 
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=os.getenv("GOOGLE_API_KEY"),
+# llm = ChatGoogleGenerativeAI(
+#     model="gemini-2.5-flash",
+#     google_api_key=os.getenv("GOOGLE_API_KEY"),
+#     temperature=0,
+#     max_tokens=1024,
+#     streaming=True
+# )
+llm = ChatOpenAI(
+    model="google/gemini-2.5-flash",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
     temperature=0,
-    max_tokens=1024,
-    streaming=True
+    streaming=True, 
 )
 
 # cl100k_base is close enough for Llama token counting
 enc = tiktoken.get_encoding("cl100k_base")
-
 prompt_template = ChatPromptTemplate.from_template("""
-You are a precise research assistant. Answer the question using ONLY the context provided below.
+You are DocuMind, a helpful AI research assistant.
 
-Rules:
-- If the answer is not in the context, say "I don't have enough information to answer this."
-- Always cite which source and page number you used, e.g. [source: paper.pdf, page 3]
-- Be concise but complete
-- Never hallucinate facts not present in the context
+First, determine the type of question:
+
+1. If it is general conversation (greetings like "hello", "hi", "thanks", small talk, or questions clearly unrelated to any document) — respond naturally and friendly. Do not reference the context or say you lack information.
+
+2. If it is a question about document content — answer using ONLY the context provided below and follow these rules:
+   - If the answer is not in the context, say "I don't find that information in the uploaded document."
+   - Be concise but complete
+   - Never hallucinate facts not present in the context
+   - Format your answer exactly like this example:
+
+   **Languages:** Python, SQL, Java, C++
+   *[Resume.pdf, p.1]*
+
+   **LLM Frameworks:** LangChain, LangGraph, MCP
+   *[Resume.pdf, p.1]*
+
+   Each point on its own line, citation on the next line in italics.
 
 Context:
 {context}
@@ -125,12 +143,15 @@ def generate(
 
    
     sources = [
-        {
-            "source": d.metadata.get("source", "unknown"),
-            "page":   d.metadata.get("page", "?"),
-            "chunk":  d.page_content[:100] + "..."
-        }
-        for d in docs
+    {
+        "source":         d.metadata.get("source", "unknown"),
+        "page":           d.metadata.get("page", "?"),
+        "chunk":          d.page_content[:100] + "...",
+        "vector_score":   d.metadata.get("vector_score", 0.0),
+        "bm25_score":     d.metadata.get("bm25_score", 0.0),
+        "reranker_score": d.metadata.get("reranker_score", 0.0),
+    }
+    for d in docs
     ]
 
     summary = metrics.summary()
@@ -151,17 +172,11 @@ def generate(
     }
 
 # generation.py — add after generate()
-
 async def generate_stream(
     question: str,
     session_id: str,
     pipeline: str = "hybrid_rerank",
 ):
-    """
-    Streaming version of generate().
-    Yields tokens as they come from the LLM.
-    Retrieval still runs fully before streaming starts.
-    """
     from src.metrics import StageTimer
 
     metrics = PipelineMetrics(
@@ -170,27 +185,31 @@ async def generate_stream(
         session_id=session_id,
     )
 
-    # ── Retrieval — runs fully first ──────────────────────────────────────────
-    docs    = retrieve(question, metrics,session_id, pipeline=pipeline)
+    # ── Retrieval ─────────────────────────────────────────────────────────────
+    docs    = retrieve(question, metrics, session_id, pipeline=pipeline)
+    context = format_context(docs)
+
     if not docs:
         yield {
             "type":    "error",
             "message": "No documents found. Please upload a PDF first."
         }
         return
-    context = format_context(docs)
-
-    # ── Build sources ─────────────────────────────────────────────────────────
+    
+    # ── Sources with scores ───────────────────────────────────────────────────
     sources = [
         {
-            "source": d.metadata.get("source", "unknown"),
-            "page":   d.metadata.get("page", "?"),
-            "chunk":  d.page_content[:100] + "..."
+            "source":         d.metadata.get("source", "unknown"),
+            "page":           d.metadata.get("page", "?"),
+            "chunk":          d.page_content[:100] + "...",
+            "vector_score":   d.metadata.get("vector_score", 0.0),
+            "bm25_score":     d.metadata.get("bm25_score", 0.0),
+            "reranker_score": d.metadata.get("reranker_score", 0.0),
         }
         for d in docs
     ]
 
-    # ── Stream generation ─────────────────────────────────────────────────────
+    # ── Generation ────────────────────────────────────────────────────────────
     prompt        = prompt_template.format_messages(
         context=context,
         question=question
@@ -208,19 +227,19 @@ async def generate_stream(
                     "token": token
                 }
 
-    metrics.generation_ms        = t.elapsed_ms
+    metrics.generation_ms            = t.elapsed_ms
     metrics.tokens.llm_input_tokens  = input_tokens
     metrics.tokens.llm_output_tokens = output_tokens
 
     cost_tracker.record(metrics)
 
-    # ── Yield final metadata ──────────────────────────────────────────────────
+    # ── Done event ────────────────────────────────────────────────────────────
     yield {
         "type":    "done",
+        "pipeline": pipeline,
         "sources": sources,
         "metrics": metrics.summary()
     }
-
 
 def compare_pipelines(question: str) -> dict:
     """
