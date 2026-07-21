@@ -3,7 +3,7 @@
 import os
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_openai import AzureOpenAIEmbeddings
+from langchain_openai import AzureOpenAIEmbeddings,ChatOpenAI
 from langchain_core.documents import Document
 from langsmith import Client
 from ragas import evaluate, EvaluationDataset, SingleTurnSample
@@ -24,11 +24,17 @@ langsmith_client = Client()
 
 # ── RAGAS LLM + embeddings ────────────────────────────────────────────────────
 
-ragas_llm = LangchainLLMWrapper(ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=os.getenv("GOOGLE_API_KEY"),
+# ragas_llm = LangchainLLMWrapper(ChatGoogleGenerativeAI(
+#     model="gemini-2.5-flash",
+#     google_api_key=os.getenv("GOOGLE_API_KEY"),
+#     temperature=0,
+# ))
+ragas_llm = ChatOpenAI(
+    model="google/gemini-2.5-flash",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
     temperature=0,
-))
+)
 
 ragas_embeddings = LangchainEmbeddingsWrapper(AzureOpenAIEmbeddings(
     azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),

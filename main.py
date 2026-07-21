@@ -4,10 +4,14 @@ import os
 import uuid
 import json
 import shutil
+import aiofiles
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi import Request
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +21,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import text
 
 load_dotenv()
+limiter = Limiter(key_func=get_remote_address)
 
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
 # ── Load models at startup ────────────────────────────────────────────────────
 print("\nLoading models...")
 from src.retreival import reranker, vectorstore, engine
@@ -85,6 +91,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# add these two lines
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -123,7 +133,8 @@ async def health():
 
 
 @app.post("/session/start")
-async def start_session():
+@limiter.limit("10/minute") 
+async def start_session(request: Request):
     """Create a new session. Call this when user opens the app."""
     session_id = str(uuid.uuid4())
     sessions[session_id] = {
@@ -136,39 +147,43 @@ async def start_session():
 
 
 @app.post("/session/end")
-async def end_session(session_id: str):
+async def end_session(request: Request,session_id: str):
     """Delete session data. Call this when user closes the app."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     await delete_session(session_id)
     return {"status": "deleted", "session_id": session_id}
 
-
 @app.post("/ingest")
+@limiter.limit("3/minute")
 async def ingest(
+    request:    Request,
     session_id: str,
-    file: UploadFile = File(...)
+    file:       UploadFile = File(...)
 ):
-    """Upload and ingest a PDF for a specific session."""
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found. Call /session/start first.")
-
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files accepted")
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: PDF, TXT, MD, DOCX, PPTX"
+        )
 
     os.makedirs("data/pdfs", exist_ok=True)
-    temp_path = f"data/pdfs/{session_id}_{file.filename}"
+    temp_path = f"data/pdfs/{file.filename}"
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # ── async file write ──────────────────────────────────────────────────────
+    async with aiofiles.open(temp_path, "wb") as buffer:
+        content = await file.read()
+        await buffer.write(content)
 
     try:
         vs, bm25, docs = ingest_pdf(temp_path, session_id)
-
         sessions[session_id]["bm25"]        = bm25
         sessions[session_id]["docs"]        = docs
         sessions[session_id]["last_active"] = datetime.now(timezone.utc)
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -181,27 +196,27 @@ async def ingest(
         "session": session_id
     }
 
-
 @app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
-    if not request.question.strip():
+@limiter.limit("10/minute")
+async def query(request: Request, query_request: QueryRequest):
+    if not query_request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    if request.session_id not in sessions:
+    if query_request.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if request.pipeline not in ["dense_only", "hybrid", "hybrid_rerank"]:
+    if query_request.pipeline not in ["dense_only", "hybrid", "hybrid_rerank"]:
         raise HTTPException(status_code=400, detail="Invalid pipeline")
 
-    sessions[request.session_id]["last_active"] = datetime.now(timezone.utc)
+    sessions[query_request.session_id]["last_active"] = datetime.now(timezone.utc)
     run_id = str(uuid.uuid4())
 
     try:
         from src.generation import generate
         result = generate(
-            question=request.question,
-            pipeline=request.pipeline,
-            session_id=request.session_id,
+            question=query_request.question,
+            pipeline=query_request.pipeline,
+            session_id=query_request.session_id,
             run_id=run_id
         )
     except Exception as e:
@@ -217,25 +232,26 @@ async def query(request: QueryRequest):
 
 
 @app.post("/query/stream")
-async def query_stream(request: QueryRequest):
-    if not request.question.strip():
+@limiter.limit("10/minute")
+async def query_stream(request: Request, query_request: QueryRequest):
+    if not query_request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    if request.session_id not in sessions:
+    if query_request.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if request.pipeline not in ["dense_only", "hybrid", "hybrid_rerank"]:
+    if query_request.pipeline not in ["dense_only", "hybrid", "hybrid_rerank"]:
         raise HTTPException(status_code=400, detail="Invalid pipeline")
 
-    sessions[request.session_id]["last_active"] = datetime.now(timezone.utc)
+    sessions[query_request.session_id]["last_active"] = datetime.now(timezone.utc)
 
     async def event_generator():
         try:
             from src.generation import generate_stream
             async for event in generate_stream(
-                question=request.question,
-                pipeline=request.pipeline,
-                session_id=request.session_id,
+                question=query_request.question,
+                pipeline=query_request.pipeline,
+                session_id=query_request.session_id,
             ):
                 # debug — print event type before serializing
                 print(f"  event type: {event.get('type')} — {type(event)}")
@@ -258,7 +274,8 @@ async def query_stream(request: QueryRequest):
 
 
 @app.get("/cost")
-async def cost_report():
+@limiter.limit("10/minute")
+async def cost_report(request: Request):
     from src.metrics import cost_tracker
     return {
         "total_queries":  cost_tracker.total_queries,
@@ -269,12 +286,13 @@ async def cost_report():
 
 
 @app.post("/compare")
-async def compare(request: QueryRequest):
-    if request.session_id not in sessions:
+@limiter.limit("2/minute") 
+async def compare(request: Request, query_request: QueryRequest):
+    if query_request.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     from src.generation import compare_pipelines
-    results = compare_pipelines(request.question, request.session_id)
+    results = compare_pipelines(query_request.question, query_request.session_id)
 
     return {
         pipeline: {
