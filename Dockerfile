@@ -13,14 +13,16 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install -r requirements.txt
 
 # pre-download reranker model so it's baked into image
 RUN python -c "from sentence_transformers import CrossEncoder; \
     CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', \
     backend='onnx', \
-    model_kwargs={'file_name': 'onnx/model_quint8_avx2.onnx'})"
+    model_kwargs={'file_name': 'onnx/model_quint8_avx2.onnx'}); \
+    print('Model preloaded')"
 
 # copy application code
 COPY . .
