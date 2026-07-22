@@ -16,12 +16,6 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# pre-download reranker model so it's baked into image
-RUN python -c "from sentence_transformers import CrossEncoder; \
-    CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', \
-    backend='onnx', \
-    model_kwargs={'file_name': 'onnx/model_quint8_avx2.onnx'}); \
-    print('Model preloaded')"
 
 # copy application code
 COPY . .
