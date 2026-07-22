@@ -1,0 +1,16 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+.env
+.git
+.gitignore
+indexes/
+data/
+*.pkl
+*.pdf
+tests/
+run_eval.py
+data/test_set.py
+eval_results.json
+test_*.py

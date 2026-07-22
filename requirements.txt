@@ -1,3 +1,8 @@
+# requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers[onnx]
+
 # LangChain
 langchain
 langchain-core
@@ -22,8 +27,8 @@ python-pptx
 rank-bm25
 
 # Reranking
-sentence-transformers
-optimum[onnxruntime]
+#sentence-transformers[onnx]
+optimum-onnx
 # API
 fastapi
 uvicorn
