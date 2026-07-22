@@ -13,8 +13,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # install Python dependencies
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip && \
+RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # pre-download reranker model so it's baked into image
