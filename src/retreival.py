@@ -6,10 +6,9 @@ from dotenv import load_dotenv
 from langchain_postgres import PGVector
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.documents import Document
-from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 from src.metrics import StageTimer, PipelineMetrics
-
+import cohere
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 import time
@@ -35,11 +34,8 @@ vectorstore = PGVector(
     connection=CONNECTION_STRING,
 )
 
-reranker = CrossEncoder(
-    "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    backend="onnx",
-    model_kwargs={"file_name": "onnx/model_quint8_avx2.onnx"} 
-)
+
+reranker = cohere.ClientV2(os.getenv("COHERE_API_KEY"))
 print(f"Reranker loaded — id: {id(reranker)}")  # prints memory address
 
 def create_engine_with_retry(url: str, retries: int = 3, delay: float = 2.0):
@@ -140,7 +136,6 @@ def rrf_fusion(
     return [item["doc"] for item in sorted_docs]
 
 
-
 def rerank(
     query: str,
     docs:  list[Document],
@@ -149,19 +144,36 @@ def rerank(
     import time
     print("  rerank() entered")
     t0 = time.perf_counter()
+
     if not docs:
         print("  No docs to rerank — returning empty list")
         return []
-    pairs = [(query, doc.page_content) for doc in docs]
-    print(f"  pairs built: {(time.perf_counter()-t0)*1000:.0f}ms")
+
     print(f"  avg doc length: {sum(len(d.page_content) for d in docs)//len(docs)} chars")
-    
+
     t1 = time.perf_counter()
-    scores = reranker.predict(pairs)
-    print(f"  predict: {(time.perf_counter()-t1)*1000:.0f}ms")
-    
-    reranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-    return [doc for doc, _ in reranked[:top_n]]
+    results = reranker.rerank(
+        query=query,
+        documents=[doc.page_content for doc in docs],
+        top_n=top_n,
+        model="rerank-v3.5",
+    )
+    print(f"  rerank API call: {(time.perf_counter()-t1)*1000:.0f}ms")
+    print(f"  total rerank(): {(time.perf_counter()-t0)*1000:.0f}ms")
+
+    # reorder docs by Cohere's ranking
+    reranked = [docs[r.index] for r in results.results]
+
+    # normalize scores to 0-1 and attach to metadata
+    scores = [r.relevance_score for r in results.results]
+    min_s  = min(scores)
+    max_s  = max(scores)
+    span   = max_s - min_s + 1e-8
+
+    for doc, score in zip(reranked, scores):
+        doc.metadata["reranker_score"] = round((score - min_s) / span, 4)
+
+    return reranked
 
 
 def retrieve_dense_only(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
@@ -218,7 +230,6 @@ def retrieve_hybrid(query: str, metrics: PipelineMetrics, session_id: str) -> li
     metrics.chunks_after_rerank = len(top_5)
     return top_5
 
-
 def retrieve_hybrid_rerank(query: str, metrics: PipelineMetrics, session_id: str) -> list[Document]:
     with StageTimer() as t:
         dense_hits = dense_search(query, session_id, top_k=10)
@@ -236,35 +247,21 @@ def retrieve_hybrid_rerank(query: str, metrics: PipelineMetrics, session_id: str
     dense_contents  = {d.page_content: i for i, d in enumerate(dense_hits)}
     sparse_contents = {d.page_content: i for i, d in enumerate(sparse_hits)}
 
-    for doc in fused:
-        doc.metadata["vector_score"] = round(1 / (60 + dense_contents.get(doc.page_content, 60) + 1), 4)
-        doc.metadata["bm25_score"]   = round(1 / (60 + sparse_contents.get(doc.page_content, 60) + 1), 4)
+    if fused:
+        max_v = max(1 / (60 + dense_contents.get(d.page_content, 60) + 1) for d in fused) + 1e-8
+        max_b = max(1 / (60 + sparse_contents.get(d.page_content, 60) + 1) for d in fused) + 1e-8
+        for doc in fused:
+            doc.metadata["vector_score"] = round((1 / (60 + dense_contents.get(doc.page_content, 60) + 1)) / max_v, 4)
+            doc.metadata["bm25_score"]   = round((1 / (60 + sparse_contents.get(doc.page_content, 60) + 1)) / max_b, 4)
 
     with StageTimer() as t:
-        pairs           = [(query, doc.page_content) for doc in fused]
-        reranker_scores = reranker.predict(pairs) if fused else []
-
-        # ── normalize reranker scores to 0-1 ─────────────────────────────────
-        if len(reranker_scores) > 0:
-            min_s = float(min(reranker_scores))
-            max_s = float(max(reranker_scores))
-            span  = max_s - min_s + 1e-8
-            normalized = [round((float(s) - min_s) / span, 4) for s in reranker_scores]
-        else:
-            normalized = []
-
-        for doc, score in zip(fused, normalized):
-            doc.metadata["reranker_score"] = score
-
-        final = sorted(zip(fused, normalized), key=lambda x: x[1], reverse=True)[:5]
-        final = [doc for doc, _ in final]
-
+        final = rerank(query, fused, top_n=5)
     metrics.rerank_ms = t.elapsed_ms
 
     metrics.chunks_retrieved    = len(fused)
     metrics.chunks_after_rerank = len(final)
     return final
-
+    
 PIPELINE_MAP = {
     "dense_only":      retrieve_dense_only,
     "hybrid":          retrieve_hybrid,

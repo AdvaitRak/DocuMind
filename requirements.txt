@@ -1,7 +1,4 @@
 # requirements.txt
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence-transformers[onnx]
 
 # LangChain
 langchain
@@ -26,9 +23,7 @@ python-pptx
 # Sparse search
 rank-bm25
 
-# Reranking
-#sentence-transformers[onnx]
-optimum-onnx
+
 # API
 fastapi
 uvicorn
@@ -41,6 +36,7 @@ langsmith
 
 # LLM providers
 openai
+cohere
 
 # Utils
 python-dotenv

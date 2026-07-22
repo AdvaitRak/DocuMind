@@ -26,7 +26,7 @@ limiter = Limiter(key_func=get_remote_address)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
 # ── Load models at startup ────────────────────────────────────────────────────
 print("\nLoading models...")
-from src.retreival import reranker, vectorstore, engine
+from src.retreival import vectorstore, engine
 from src.generation import llm
 from src.metrics import cost_tracker
 from src.ingest import ingest_pdf
