@@ -218,14 +218,26 @@ async def generate_stream(
     output_tokens = 0
 
     with StageTimer() as t:
-        async for chunk in llm.astream(prompt):
-            token = chunk.content
-            if token:
-                output_tokens += count_tokens(token)
-                yield {
-                    "type":  "token",
-                    "token": token
-                }
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                async for chunk in llm.astream(prompt):
+                    token = chunk.content
+                    if token:
+                        output_tokens += count_tokens(token)
+                        yield {
+                            "type":  "token",
+                            "token": token
+                        }
+                break  # success — exit retry loop
+            except Exception as e:
+                print(f"  Stream attempt {attempt+1} failed: {e}")
+                if attempt == max_retries - 1:
+                    yield {
+                        "type":    "error",
+                        "message": "Stream failed after retries. Please try again."
+                    }
+                    return
 
     metrics.generation_ms            = t.elapsed_ms
     metrics.tokens.llm_input_tokens  = input_tokens
