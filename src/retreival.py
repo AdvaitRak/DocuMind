@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 import time
 from sqlalchemy.exc import OperationalError
+import re
 
 load_dotenv()
 
@@ -99,7 +100,7 @@ def sparse_search(query: str, session_id: str, top_k: int = 50) -> list[Document
         print(f"  No BM25 index for session {session_id[:8]} — skipping sparse search")
         return []
 
-    tokens = query.lower().split()
+    tokens = re.findall(r"\w+", query.lower())
     scores = session["bm25"].get_scores(tokens)
     scored = sorted(
         zip(session["docs"], scores),
