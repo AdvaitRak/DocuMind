@@ -1,7 +1,7 @@
 # src/ingest.py
 
 import os
-import fitz
+import pymupdf as fitz
 import pickle
 import tiktoken
 import shutil
@@ -12,6 +12,7 @@ from langchain_openai import AzureOpenAIEmbeddings
 from langchain_postgres import PGVector
 from rank_bm25 import BM25Okapi
 from src.metrics import StageTimer, TokenUsage
+import re
 
 load_dotenv()
 
@@ -39,23 +40,96 @@ splitter = RecursiveCharacterTextSplitter(
 )
 
 # ── Extractors ────────────────────────────────────────────────────────────────
+def _meta(file_path, page, session_id, **extra):
+    m = {
+        "source":     os.path.basename(file_path),
+        "page":       page,
+        "session_id": session_id,
+    }
+    m.update(extra)
+    return m
+
+
+def rows_to_markdown(rows) -> str:
+    """List of rows (cells may be None) -> markdown table. '' if it isn't a real table."""
+    rows = [[(c or "").replace("\n", " ").strip() for c in r] for r in rows]
+    rows = [r for r in rows if any(r)]
+    if len(rows) < 2:
+        return ""
+    width = max(len(r) for r in rows)
+    if width < 2:
+        return ""
+    rows = [r + [""] * (width - len(r)) for r in rows]
+
+    esc  = lambda s: s.replace("|", "\\|")
+    line = lambda r: "| " + " | ".join(esc(c) for c in r) + " |"
+    out  = [line(rows[0]), "| " + " | ".join(["---"] * width) + " |"]
+    out += [line(r) for r in rows[1:]]
+    return "\n".join(out)
+
+
+def split_table(md: str, page: int, max_chars: int = 1500) -> list[str]:
+    """Keep small tables whole. Split big ones by rows, repeating the header in every part."""
+    lines  = md.split("\n")
+    header = lines[:2]
+    body   = lines[2:]
+    prefix = f"Table (page {page}):\n"
+
+    if len(md) <= max_chars:
+        return [prefix + md]
+
+    parts, cur, size = [], [], 0
+    for row in body:
+        if cur and size + len(row) > max_chars:
+            parts.append(prefix + "\n".join(header + cur))
+            cur, size = [], 0
+        cur.append(row)
+        size += len(row) + 1
+    if cur:
+        parts.append(prefix + "\n".join(header + cur))
+    return parts
 
 def extract_pdf(file_path: str, session_id: str) -> list[Document]:
-    doc    = fitz.open(file_path)
-    pages  = []
+    doc = fitz.open(file_path)
+    out = []
     for i, page in enumerate(doc):
-        text = page.get_text().strip()
+        page_no     = i + 1
+        table_rects = []
+        tables_md   = []
+
+        try:
+            for tab in page.find_tables().tables:
+                md = rows_to_markdown(tab.extract())
+                if md:
+                    table_rects.append(fitz.Rect(tab.bbox))
+                    tables_md.append(md)
+        except Exception as e:
+            print(f"  table detection failed on page {page_no}: {e}")
+
+        
+        parts = []
+        for b in page.get_text("blocks", sort=True):
+            x0, y0, x1, y1, txt, _, btype = b[:7]
+            if btype != 0 or not txt.strip():
+                continue
+            center = fitz.Point((x0 + x1) / 2, (y0 + y1) / 2)
+            if any(center in r for r in table_rects):
+                continue
+            parts.append(txt.strip())
+        text = "\n".join(parts).strip()
+
         if text:
-            pages.append(Document(
+            out.append(Document(
                 page_content=text,
-                metadata={
-                    "source":     os.path.basename(file_path),
-                    "page":       i + 1,
-                    "session_id": session_id
-                }
+                metadata=_meta(file_path, page_no, session_id),
+            ))
+        for md in tables_md:
+            out.append(Document(
+                page_content=md,
+                metadata=_meta(file_path, page_no, session_id, content_type="table"),
             ))
     doc.close()
-    return pages
+    return out
 
 
 def extract_txt(file_path: str, session_id: str) -> list[Document]:
@@ -73,60 +147,77 @@ def extract_txt(file_path: str, session_id: str) -> list[Document]:
 
 def extract_docx(file_path: str, session_id: str) -> list[Document]:
     from docx import Document as DocxDocument
-    doc   = DocxDocument(file_path)
-    pages = []
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc       = DocxDocument(file_path)
+    out       = []
     page_text = []
     page_num  = 1
 
-    for para in doc.paragraphs:
-        if para.text.strip():
-            page_text.append(para.text.strip())
-        # treat every 15 paragraphs as a "page" for metadata
-        if len(page_text) >= 15:
-            pages.append(Document(
+    def flush():
+        nonlocal page_text, page_num
+        if page_text:
+            out.append(Document(
                 page_content="\n".join(page_text),
-                metadata={
-                    "source":     os.path.basename(file_path),
-                    "page":       page_num,
-                    "session_id": session_id
-                }
+                metadata=_meta(file_path, page_num, session_id),
             ))
             page_text = []
             page_num += 1
 
-    # remaining paragraphs
-    if page_text:
-        pages.append(Document(
-            page_content="\n".join(page_text),
-            metadata={
-                "source":     os.path.basename(file_path),
-                "page":       page_num,
-                "session_id": session_id
-            }
-        ))
-    return pages
-
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            t = Paragraph(child, doc).text.strip()
+            if t:
+                page_text.append(t)
+            if len(page_text) >= 15:        # same pseudo-page rule as before
+                flush()
+        elif child.tag.endswith("}tbl"):
+            table = Table(child, doc)
+            rows = []
+            for row in table.rows:
+                seen, cells = set(), []
+                for cell in row.cells:      # merged cells repeat: keep the first
+                    if id(cell._tc) in seen:
+                        continue
+                    seen.add(id(cell._tc))
+                    cells.append(cell.text)
+                rows.append(cells)
+            md = rows_to_markdown(rows)
+            if md:
+                out.append(Document(
+                    page_content=md,
+                    metadata=_meta(file_path, page_num, session_id, content_type="table"),
+                ))
+    flush()
+    return out
 
 def extract_pptx(file_path: str, session_id: str) -> list[Document]:
     from pptx import Presentation
-    prs   = Presentation(file_path)
-    pages = []
+    prs = Presentation(file_path)
+    out = []
     for i, slide in enumerate(prs.slides):
-        text = "\n".join([
-            shape.text.strip()
-            for shape in slide.shapes
-            if hasattr(shape, "text") and shape.text.strip()
-        ])
-        if text:
-            pages.append(Document(
-                page_content=text,
-                metadata={
-                    "source":     os.path.basename(file_path),
-                    "page":       i + 1,
-                    "session_id": session_id
-                }
+        page_no, texts, tables = i + 1, [], []
+        for shape in slide.shapes:
+            if getattr(shape, "has_table", False) and shape.has_table:
+                rows = [[c.text for c in r.cells] for r in shape.table.rows]
+                md = rows_to_markdown(rows)
+                if md:
+                    tables.append(md)
+            elif hasattr(shape, "text") and shape.text.strip():
+                texts.append(shape.text.strip())
+
+        if texts:
+            out.append(Document(
+                page_content="\n".join(texts),
+                metadata=_meta(file_path, page_no, session_id),
             ))
-    return pages
+        for md in tables:
+            out.append(Document(
+                page_content=md,
+                metadata=_meta(file_path, page_no, session_id, content_type="table"),
+            ))
+    return out
 
 
 def extract_document(file_path: str, session_id: str) -> list[Document]:
@@ -146,17 +237,24 @@ def extract_document(file_path: str, session_id: str) -> list[Document]:
 # ── Chunking ──────────────────────────────────────────────────────────────────
 
 def chunk_documents(pages: list[Document]) -> list[Document]:
-    chunks = splitter.split_documents(pages)
+    text_docs  = [p for p in pages if p.metadata.get("content_type") != "table"]
+    table_docs = [p for p in pages if p.metadata.get("content_type") == "table"]
+
+    chunks = splitter.split_documents(text_docs)
+    for t in table_docs:
+        for part in split_table(t.page_content, t.metadata["page"]):
+            chunks.append(Document(page_content=part, metadata=dict(t.metadata)))
+
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_index"] = i
-    print(f"  created {len(chunks)} chunks")
+    print(f"  created {len(chunks)} chunks ({len(table_docs)} tables)")
     return chunks
 
 # ── BM25 ──────────────────────────────────────────────────────────────────────
 
 def build_bm25_index(chunks: list[Document]) -> tuple:
     """Build BM25 index in memory — no disk persistence."""
-    tokenized = [doc.page_content.lower().split() for doc in chunks]
+    tokenized = [re.findall(r"\w+", doc.page_content.lower()) for doc in chunks]
     bm25      = BM25Okapi(tokenized)
     return bm25, chunks
 
@@ -200,9 +298,10 @@ def ingest_pdf(file_path: str, session_id: str) -> tuple:
     print(f"  extraction: {t.elapsed_ms:.0f}ms — {len(pages)} pages")
 
     # page limit check
-    if len(pages) > MAX_PAGES:
+    page_count = len({p.metadata["page"] for p in pages})
+    if page_count > MAX_PAGES:
         raise ValueError(
-            f"Document has {len(pages)} pages. "
+            f"Document has {page_count} pages. "
             f"Maximum allowed is {MAX_PAGES}. "
             f"Please upload a shorter document."
         )
