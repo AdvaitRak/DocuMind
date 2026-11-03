@@ -39,6 +39,15 @@ scheduler = AsyncIOScheduler()
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
+def purge_session_chunks(session_id: str) -> int:
+    with engine.begin() as conn:      # begin() commits automatically
+        res = conn.execute(
+            text("DELETE FROM langchain_pg_embedding "
+                 "WHERE cmetadata->>'session_id' = :sid"),
+            {"sid": session_id},
+        )
+    return res.rowcount
+
 async def delete_session(session_id: str):
     """Delete all chunks for a session from pgvector and RAM."""
     try:
@@ -147,11 +156,10 @@ async def start_session(request: Request):
 
 
 @app.post("/session/end")
-async def end_session(request: Request,session_id: str):
+async def end_session(request: Request, session_id: str):
     """Delete session data. Call this when user closes the app."""
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    await delete_session(session_id)
+    purge_session_chunks(session_id)
+    sessions.pop(session_id, None)
     return {"status": "deleted", "session_id": session_id}
 
 @app.post("/ingest")
@@ -161,6 +169,8 @@ async def ingest(
     session_id: str,
     file:       UploadFile = File(...)
 ):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -185,6 +195,9 @@ async def ingest(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        purge_session_chunks(session_id)
+        sessions[session_id]["bm25"] = None
+        sessions[session_id]["docs"] = []
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(temp_path):
