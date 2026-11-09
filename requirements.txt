@@ -43,3 +43,6 @@ python-dotenv
 numpy
 tiktoken
 aiofiles
+
+# Azure 
+azure-ai-documentintelligence
