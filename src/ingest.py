@@ -1,7 +1,6 @@
 # src/ingest.py
 
 import os
-import pymupdf as fitz
 import pickle
 import tiktoken
 import shutil
@@ -13,6 +12,10 @@ from langchain_postgres import PGVector
 from rank_bm25 import BM25Okapi
 from src.metrics import StageTimer, TokenUsage
 import re
+from datetime import datetime, timezone
+import pymupdf as fitz
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.core.credentials import AzureKeyCredential
 
 load_dotenv()
 
@@ -21,7 +24,10 @@ COLLECTION_NAME   = "documind_chunks"
 MAX_PAGES         = int(os.getenv("MAX_PDF_PAGES", 20))
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
-
+OCR_MIN_CHARS        = 30    
+MAX_OCR_PAGES        = 10   
+DAILY_OCR_PAGE_LIMIT = 100   
+_ocr_daily = {"day": None, "pages": 0}
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 embeddings = AzureOpenAIEmbeddings(
@@ -39,7 +45,8 @@ splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", ".", " "]
 )
 
-# ── Extractors ────────────────────────────────────────────────────────────────
+# ── Extractors and helper functions (extract_pdf is main)────────────────────────────────────────────────────────────────
+
 def _meta(file_path, page, session_id, **extra):
     m = {
         "source":     os.path.basename(file_path),
@@ -89,24 +96,76 @@ def split_table(md: str, page: int, max_chars: int = 1500) -> list[str]:
         parts.append(prefix + "\n".join(header + cur))
     return parts
 
+def _reserve_ocr_pages(n: int):
+    today = datetime.now(timezone.utc).date()
+    if _ocr_daily["day"] != today:
+        _ocr_daily["day"], _ocr_daily["pages"] = today, 0
+    if _ocr_daily["pages"] + n > DAILY_OCR_PAGE_LIMIT:
+        raise ValueError(
+            "The daily OCR limit has been reached. Try again tomorrow, "
+            "or upload a PDF with selectable text."
+        )
+    _ocr_daily["pages"] += n
+
+
+def _page_ranges(nums: list[int]) -> str:
+    """[1, 2, 3, 5] -> '1-3,5' (the format Azure expects)."""
+    nums = sorted(nums)
+    out, start, prev = [], nums[0], nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        out.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = n
+    out.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(out)
+
+
+def azure_ocr_pages(file_path: str, page_numbers: list[int]) -> dict[int, str]:
+    """OCR only the given 1-based pages with Azure prebuilt-read. Returns {page: text}."""
+    endpoint, key = os.getenv("DOCINTEL_ENDPOINT"), os.getenv("DOCINTEL_KEY")
+    if not endpoint or not key:
+        print("  OCR skipped: DOCINTEL_ENDPOINT / DOCINTEL_KEY not set")
+        return {}
+    client = DocumentIntelligenceClient(endpoint, AzureKeyCredential(key))
+    with open(file_path, "rb") as f:
+        result = client.begin_analyze_document(
+            "prebuilt-read",
+            f,
+            pages=_page_ranges(page_numbers),
+            content_type="application/octet-stream",
+        ).result()
+    return {
+        p.page_number: "\n".join(line.content for line in (p.lines or []))
+        for p in result.pages
+    }
+
 def extract_pdf(file_path: str, session_id: str) -> list[Document]:
     doc = fitz.open(file_path)
+
+    
+    if len(doc) > MAX_PAGES:
+        raise ValueError(f"Document has {len(doc)} pages. Maximum allowed is {MAX_PAGES}.")
+
     out = []
+    scanned = []    
+    fallback = {}    
+
     for i, page in enumerate(doc):
-        page_no     = i + 1
-        table_rects = []
-        tables_md   = []
+        page_no = i + 1
+        table_rects, tables_md = [], []
 
         try:
             for tab in page.find_tables().tables:
-                md = rows_to_markdown(tab.extract())
+                md = rows_to_markdown(table_rows(page, tab))
                 if md:
                     table_rects.append(fitz.Rect(tab.bbox))
                     tables_md.append(md)
         except Exception as e:
             print(f"  table detection failed on page {page_no}: {e}")
 
-        
+       
         parts = []
         for b in page.get_text("blocks", sort=True):
             x0, y0, x1, y1, txt, _, btype = b[:7]
@@ -118,19 +177,45 @@ def extract_pdf(file_path: str, session_id: str) -> list[Document]:
             parts.append(txt.strip())
         text = "\n".join(parts).strip()
 
-        if text:
-            out.append(Document(
-                page_content=text,
-                metadata=_meta(file_path, page_no, session_id),
-            ))
-        for md in tables_md:
-            out.append(Document(
-                page_content=md,
-                metadata=_meta(file_path, page_no, session_id, content_type="table"),
-            ))
-    doc.close()
-    return out
+        if len(text) < OCR_MIN_CHARS and not tables_md and page.get_images():
+            scanned.append(page_no)
+            if text:
+                fallback[page_no] = text
+        elif text:
+            out.append(Document(page_content=text,
+                                metadata=_meta(file_path, page_no, session_id)))
 
+        for md in tables_md:
+            out.append(Document(page_content=md,
+                                metadata=_meta(file_path, page_no, session_id,
+                                               content_type="table")))
+    doc.close()
+
+    if scanned:
+        if len(scanned) > MAX_OCR_PAGES:
+            raise ValueError(
+                f"This looks like a scanned document ({len(scanned)} pages need OCR). "
+                f"The limit is {MAX_OCR_PAGES} pages. Please upload a shorter file."
+            )
+        _reserve_ocr_pages(len(scanned))
+        try:
+            ocr_text = azure_ocr_pages(file_path, scanned)
+        except Exception as e:
+            print(f"  Azure OCR failed: {e}")
+            ocr_text = {}
+
+        got = 0
+        for n in scanned:
+            t = (ocr_text.get(n) or "").strip()
+            if t:
+                got += 1
+                out.append(Document(page_content=t,
+                                    metadata=_meta(file_path, n, session_id, ocr=True)))
+            elif n in fallback:
+                out.append(Document(page_content=fallback[n],
+                                    metadata=_meta(file_path, n, session_id)))
+        print(f"  OCR: requested {len(scanned)} page(s), got text for {got}")
+    return out
 
 def extract_txt(file_path: str, session_id: str) -> list[Document]:
     with open(file_path, "r", encoding="utf-8") as f:
